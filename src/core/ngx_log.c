@@ -111,61 +111,87 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
     ssize_t      n;
     ngx_uint_t   wrote_stderr, debug_connection;
     u_char       errstr[NGX_MAX_ERROR_STR];
+    u_char       json_buf[NGX_MAX_ERROR_STR];
+    u_char      *j;
 
     last = errstr + NGX_MAX_ERROR_STR;
+    p = errstr;
 
-    p = ngx_cpymem(errstr, ngx_cached_err_log_time.data,
-                   ngx_cached_err_log_time.len);
-
-    p = ngx_slprintf(p, last, " [%V] ", &err_levels[level]);
-
-    /* pid#tid */
-    p = ngx_slprintf(p, last, "%P#" NGX_TID_T_FMT ": ",
-                    ngx_log_pid, ngx_log_tid);
-
-    if (log->connection) {
-        p = ngx_slprintf(p, last, "*%uA ", log->connection);
-    }
-
+    // 1. Start building normal log message in errstr
     msg = p;
 
 #if (NGX_HAVE_VARIADIC_MACROS)
-
     va_start(args, fmt);
     p = ngx_vslprintf(p, last, fmt, args);
     va_end(args);
-
 #else
-
     p = ngx_vslprintf(p, last, fmt, args);
-
 #endif
 
     if (err) {
         p = ngx_log_errno(p, last, err);
     }
 
-    if (level != NGX_LOG_DEBUG && log->handler) {
-        p = log->handler(log, p, last - p);
+    *p = '\0';
+    size_t msg_len = p - msg;
+
+    // 2. Escape the message using ngx_escape_json
+    size_t escaped_len = ngx_escape_json(NULL, msg, msg_len);
+    u_char *escaped_msg;
+
+    if (escaped_len > 0) {
+        // Allocate buffer for escaped message
+        if (escaped_len + msg_len > NGX_MAX_ERROR_STR / 2) {
+            // Too large, truncate
+            msg_len = NGX_MAX_ERROR_STR / 2 - escaped_len;
+        }
+
+        escaped_msg = ngx_pnalloc(ngx_cycle->pool, msg_len + escaped_len);
+        if (escaped_msg == NULL) {
+            return;
+        }
+
+        ngx_escape_json(escaped_msg, msg, msg_len);
+        msg_len = msg_len + escaped_len;
+    } else {
+        escaped_msg = msg;
     }
 
-    if (p > last - NGX_LINEFEED_SIZE) {
-        p = last - NGX_LINEFEED_SIZE;
+    // 3. Build JSON structured log in json_buf
+    j = json_buf;
+
+    j = ngx_slprintf(j, json_buf + NGX_MAX_ERROR_STR,
+        "{"
+            "\"timestamp\":\"%V\","
+            "\"level\":\"%V\","
+            "\"pid\":%P,"
+            "\"tid\":%" NGX_TID_T_FMT,
+        &ngx_cached_err_log_time,
+        &err_levels[level],
+        ngx_log_pid,
+        ngx_log_tid);
+
+    if (log->connection) {
+        j = ngx_slprintf(j, json_buf + NGX_MAX_ERROR_STR,
+            ",\"connection\":%uA", log->connection);
     }
 
-    ngx_linefeed(p);
+    j = ngx_slprintf(j, json_buf + NGX_MAX_ERROR_STR,
+        ",\"message\":\"%*s\"}", msg_len, escaped_msg);
 
+    ngx_linefeed(j);
+
+    // 4. Write the log
     wrote_stderr = 0;
     debug_connection = (log->log_level & NGX_LOG_DEBUG_CONNECTION) != 0;
 
     while (log) {
-
         if (log->log_level < level && !debug_connection) {
             break;
         }
 
         if (log->writer) {
-            log->writer(log, level, errstr, p - errstr);
+            log->writer(log, level, json_buf, j - json_buf);
             goto next;
         }
 
@@ -180,7 +206,7 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
             goto next;
         }
 
-        n = ngx_write_fd(log->file->fd, errstr, p - errstr);
+        n = ngx_write_fd(log->file->fd, json_buf, j - json_buf);
 
         if (n == -1 && ngx_errno == NGX_ENOSPC) {
             log->disk_full_time = ngx_time();
@@ -191,23 +217,17 @@ ngx_log_error_core(ngx_uint_t level, ngx_log_t *log, ngx_err_t err,
         }
 
     next:
-
         log = log->next;
     }
 
-    if (!ngx_use_stderr
-        || level > NGX_LOG_WARN
-        || wrote_stderr)
-    {
+    // 5. Also write to stderr if needed
+    if (!ngx_use_stderr || level > NGX_LOG_WARN || wrote_stderr) {
         return;
     }
 
-    msg -= (7 + err_levels[level].len + 3);
-
-    (void) ngx_sprintf(msg, "nginx: [%V] ", &err_levels[level]);
-
-    (void) ngx_write_console(ngx_stderr, msg, p - msg);
+    (void) ngx_write_console(ngx_stderr, json_buf, j - json_buf);
 }
+
 
 
 #if !(NGX_HAVE_VARIADIC_MACROS)
